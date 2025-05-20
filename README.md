@@ -1,0 +1,2 @@
+# Pelican
+Local AI 
