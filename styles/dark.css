@@ -1,0 +1,13 @@
+:root {
+  --bg-primary: #1a1a1a;
+  --bg-secondary: #2d2d2d;
+  --text-primary: #f0f0f0;
+  --text-secondary: #b0b0b0;
+  --accent-color: #4d8bf0;
+  --scrollbar-track: #252525;
+  --scrollbar-thumb: #4a4a4a;
+  --scrollbar-thumb-hover: #5a5a5a;
+  --code-bg: #2a2a2a;
+  --message-user-bg: #2e476b;
+  --message-ai-bg: #333333;
+}

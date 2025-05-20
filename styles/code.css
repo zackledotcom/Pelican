@@ -1,0 +1,42 @@
+.code-block-container {
+  position: relative;
+  margin: 1rem 0;
+  border-radius: 0.5rem;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+
+.code-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+  background: var(--code-bg);
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
+.code-toolbar button {
+  background: none;
+  border: 1px solid var(--text-secondary);
+  color: var(--text-secondary);
+  padding: 0.25rem 0.5rem;
+  border-radius: 0.25rem;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.code-toolbar button:hover {
+  background: rgba(255,255,255,0.1);
+}
+
+pre {
+  margin: 0 !important;
+  border-radius: 0 !important;
+}
+
+pre code {
+  font-family: 'Fira Code', monospace !important;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
