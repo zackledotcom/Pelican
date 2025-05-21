@@ -1,99 +1,283 @@
-// server.js
-import express from 'express';
-import { Ollama } from 'ollama';
-import fs from 'fs';
-import path from 'path';
-import { ChromaClient } from 'chromadb';
 
+const express = require('express');
+const cors = require('cors');
+const { ChromaClient } = require('chromadb');
+const { encode } = require('gpt-tokenizer');
+const ollama = require('ollama');
+const path = require('path');
+
+// Initialize Express app
 const app = express();
-const ollama = new Ollama({ host: 'http://localhost:11434' });
+app.use(cors());
+app.use(express.json());
+
+// Initialize Chroma client
 const chroma = new ChromaClient();
 
-// Memory management
-class ContextManager {
-  constructor() {
-    this.sessions = new Map();
-    this.MAX_TOKENS = 4096;
-  }
-
-  async getContext(sessionId, prompt) {
-    const session = this.sessions.get(sessionId) || {
-      messages: [],
-      tokens: 0
-    };
-
-    // Add semantic search from vector DB
-    const relevantMemories = await chroma.query({
-      collection: 'conversation_memories',
-      queryText: prompt,
-      nResults: 3
-    });
-
-    // Compress old messages if needed
-    if (session.tokens > this.MAX_TOKENS * 0.7) {
-      await this.compressContext(session);
-    }
-
-    return {
-      ...session,
-      relevantMemories
-    };
-  }
-
-  async compressContext(session) {
-    // Summarize older messages
-    const summary = await ollama.chat({
-      model: 'llama3',
-      messages: [
-        {
-          role: 'system',
-          content: 'Summarize this conversation history keeping key details:'
-        },
-        ...session.messages.slice(0, -5)
-      ]
-    });
-
-    session.messages = [
-      { role: 'system', content: `Context summary: ${summary}` },
-      ...session.messages.slice(-5)
-    ];
-    session.tokens = await this.countTokens(session.messages);
-  }
+// Helper functions
+function deduplicateMemories(memories) {
+  const seen = new Set();
+  return memories.filter(mem => {
+    const content = mem.content.trim();
+    if (seen.has(content) || content.length < 10) return false;
+    seen.add(content);
+    return true;
+  });
 }
 
-// File processing
-app.post('/api/upload', async (req, res) => {
-  const file = req.files.file;
-  const content = file.data.toString();
+function summarizeMemories(memories, tokenLimit) {
+  let totalTokens = 0;
+  const result = [];
   
-  // Store in vector DB
-  await chroma.addDocuments({
-    collection: 'uploaded_files',
-    documents: [content],
-    metadatas: [{ filename: file.name }]
-  });
-
-  res.json({ status: 'processed' });
-});
-
-// Streaming endpoint
-app.post('/api/chat', async (req, res) => {
-  const { messages, sessionId, model, params } = req.body;
-  
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  const stream = await ollama.chat({
-    model: model || 'llama3',
-    messages,
-    options: params,
-    stream: true
-  });
-
-  for await (const chunk of stream) {
-    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  for (const memory of memories) {
+    const tokens = encode(memory.content).length;
+    if (totalTokens + tokens <= tokenLimit) {
+      result.push(memory);
+      totalTokens += tokens;
+    } else {
+      break;
+    }
   }
+  
+  return result;
+}
 
-  res.end();
+// API endpoints
+app.post('/api/query', async (req, res) => {
+  try {
+    const { userPrompt } = req.body;
+    if (!userPrompt) {
+      return res.status(400).json({ error: 'User prompt is required' });
+    }
+    
+    // Query vector database
+    const results = await chroma.query({
+      collection: 'uploaded_files',
+      queryText: userPrompt,
+      nResults: 10
+    });
+    
+    // Process memories
+    let memories = (results || [])
+      .map(mem => ({
+        meta: mem.metadata || {},
+        content: mem.document || mem.content || '',
+        pinned: mem.metadata?.pinned || false,
+        score: mem.metadata?.score || 0
+      }))
+      .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.score - a.score));
+    
+    memories = deduplicateMemories(memories);
+    
+    // Handle token limits
+    const totalTokens = memories.reduce((sum, m) => sum + encode(m.content).length, 0);
+    let formattedMemories;
+    
+    if (memories.length > 5 || totalTokens > 4000) {
+      // Summarize with LLM
+      const summary = await ollama.chat({
+        model: 'llama3',
+        messages: [
+          { role: 'system', content: 'Summarize the following context for use in a chat:' },
+          { role: 'user', content: memories.map(m => m.content).join('\n\n') }
+        ]
+      });
+      formattedMemories = [{ role: 'system', content: `Context summary: ${summary.message.content}` }];
+    } else {
+      memories = summarizeMemories(memories, 4000);
+      formattedMemories = memories.map(mem => ({
+        role: 'system',
+        content: `Context from "${mem.meta?.filename || 'memory'}"${mem.pinned ? ' (pinned)' : ''}${mem.meta?.timestamp ? ` (uploaded ${new Date(mem.meta.timestamp).toLocaleDateString()})` : ''}: ${mem.content}`
+      }));
+    }
+    
+    res.json({ memories: formattedMemories });
+  } catch (error) {
+    console.error('Error processing query:', error);
+    res.status(500).json({ error: 'Failed to process query', details: error.message });
+  }
 });
+
+// Chat endpoint
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { messages } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'Valid messages array is required' });
+    }
+    
+    const response = await ollama.chat({
+      model: 'llama3',
+      messages
+    });
+    
+    res.json({ response });
+  } catch (error) {
+    console.error('Error in chat:', error);
+    res.status(500).json({ error: 'Failed to get chat response', details: error.message });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Handle process communication for Electron
+process.on('message', (message) => {
+  console.log('Received message from main process:', message);
+  // Handle messages from main process
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down server...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+module.exports = app;
+
+const cors = require('cors');
+const { ChromaClient } = require('chromadb');
+const { encode } = require('gpt-tokenizer');
+const ollama = require('ollama');
+const path = require('path');
+
+// Initialize Express app
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Initialize Chroma client
+const chroma = new ChromaClient();
+
+// Helper functions
+function deduplicateMemories(memories) {
+  const seen = new Set();
+  return memories.filter(mem => {
+    const content = mem.content.trim();
+    if (seen.has(content) || content.length < 10) return false;
+    seen.add(content);
+    return true;
+  });
+}
+
+function summarizeMemories(memories, tokenLimit) {
+  let totalTokens = 0;
+  const result = [];
+  
+  for (const memory of memories) {
+    const tokens = encode(memory.content).length;
+    if (totalTokens + tokens <= tokenLimit) {
+      result.push(memory);
+      totalTokens += tokens;
+    } else {
+      break;
+    }
+  }
+  
+  return result;
+}
+
+// API endpoints
+app.post('/api/query', async (req, res) => {
+  try {
+    const { userPrompt } = req.body;
+    if (!userPrompt) {
+      return res.status(400).json({ error: 'User prompt is required' });
+    }
+    
+    // Query vector database
+    const results = await chroma.query({
+      collection: 'uploaded_files',
+      queryText: userPrompt,
+      nResults: 10
+    });
+    
+    // Process memories
+    let memories = (results || [])
+      .map(mem => ({
+        meta: mem.metadata || {},
+        content: mem.document || mem.content || '',
+        pinned: mem.metadata?.pinned || false,
+        score: mem.metadata?.score || 0
+      }))
+      .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || (b.score - a.score));
+    
+    memories = deduplicateMemories(memories);
+    
+    // Handle token limits
+    const totalTokens = memories.reduce((sum, m) => sum + encode(m.content).length, 0);
+    let formattedMemories;
+    
+    if (memories.length > 5 || totalTokens > 4000) {
+      // Summarize with LLM
+      const summary = await ollama.chat({
+        model: 'llama3',
+        messages: [
+          { role: 'system', content: 'Summarize the following context for use in a chat:' },
+          { role: 'user', content: memories.map(m => m.content).join('\n\n') }
+        ]
+      });
+      formattedMemories = [{ role: 'system', content: `Context summary: ${summary.message.content}` }];
+    } else {
+      memories = summarizeMemories(memories, 4000);
+      formattedMemories = memories.map(mem => ({
+        role: 'system',
+        content: `Context from "${mem.meta?.filename || 'memory'}"${mem.pinned ? ' (pinned)' : ''}${mem.meta?.timestamp ? ` (uploaded ${new Date(mem.meta.timestamp).toLocaleDateString()})` : ''}: ${mem.content}`
+      }));
+    }
+    
+    res.json({ memories: formattedMemories });
+  } catch (error) {
+    console.error('Error processing query:', error);
+    res.status(500).json({ error: 'Failed to process query', details: error.message });
+  }
+});
+
+// Chat endpoint
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { messages } = req.body;
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'Valid messages array is required' });
+    }
+    
+    const response = await ollama.chat({
+      model: 'llama3',
+      messages
+    });
+    
+    res.json({ response });
+  } catch (error) {
+    console.error('Error in chat:', error);
+    res.status(500).json({ error: 'Failed to get chat response', details: error.message });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+// Handle process communication for Electron
+process.on('message', (message) => {
+  console.log('Received message from main process:', message);
+  // Handle messages from main process
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down server...');
+  server.close(() => {
+    console.log('Server closed');
+    process.exit(0);
+  });
+});
+
+module.exports = app;
